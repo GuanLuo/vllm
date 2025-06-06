@@ -315,7 +315,7 @@ class NixlConnectorScheduler:
             remote_block_ids=computed_block_ids,
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
-            remote_port=self.,
+            remote_port=self.side_channel_port,
         )
 
 
