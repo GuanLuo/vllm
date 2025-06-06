@@ -175,8 +175,7 @@ class NixlConnectorScheduler:
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT +
-            vllm_config.parallel_config.data_parallel_rank_local *
-            vllm_config.parallel_config.tensor_parallel_size)
+            vllm_config.parallel_config.data_parallel_rank_local)
         logger.info("Initializing NIXL Scheduler %s", engine_id)
 
         # Requests that need to start recv.
@@ -316,7 +315,7 @@ class NixlConnectorScheduler:
             remote_block_ids=computed_block_ids,
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
+            remote_port=self.,
         )
 
 
@@ -409,7 +408,7 @@ class NixlConnectorWorker:
 
         # Listen for new requests for metadata.
         host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
-        path = make_zmq_path("tcp", host, port)
+        path = make_zmq_path("tcp", "localhost", port)
         logger.debug("Starting listening on path: %s", path)
         with zmq_ctx(zmq.ROUTER, path) as sock:
             ready_event.set()
