@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 GET_META_MSG = b"get_meta_msg"
+PUT_META_MSG = b"put_meta_msg"
 
 logger = init_logger(__name__)
 
@@ -182,6 +183,48 @@ class NixlConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
+
+        # Background thread for establishing new connections.
+        self._nixl_metadata_listener_t: Optional[threading.Thread] = None
+
+        ready_event = threading.Event()
+        self._nixl_metadata_listener_t = threading.Thread(
+            target=self._nixl_metadata_listener,
+            args=(self, ready_event, side_channel_port),
+            daemon=True,
+            name="nixl_metadata_listener")
+        self._nixl_metadata_listener_t.start()
+        # Note: here has the assumption that the connector scheduler is always
+        # created before any connector worker.
+        ready_event.wait()
+
+    @staticmethod
+    def _nixl_metadata_listener(scheduler: NixlConnectorScheduler, ready_event: threading.Event, base_port: int):
+        """Background thread for getting new NIXL metadata."""
+
+        # Store the encoded metadata for each rank
+        encoded_data: dict[int, bytes] = {}
+
+        # Listen for new requests with metadata, directly use localhost
+        # here for listener because NixlConnectorScheduler should be initialized
+        # on main worker which is on envs.VLLM_NIXL_SIDE_CHANNEL_HOST.
+        path = make_zmq_path("tcp", "localhost", base_port)
+        logger.debug("Starting listening on path: %s", path)
+        with zmq_ctx(zmq.ROUTER, path) as sock:
+            ready_event.set()
+            while True:
+                identity, _, msg = sock.recv_multipart()
+                # Decode the message which contains one of the following messages
+                # (GET_META_MSG, rank)
+                # (PUT_META_MSG, rank, encoded_data)
+                msg_tuple = msgspec.msgpack.decode(msg)
+                if msg_tuple[0] == GET_META_MSG:
+                    sock.send_multipart((identity, b"", encoded_data[msg_tuple[1]]))
+                elif msg_tuple[0] == PUT_META_MSG:
+                    encoded_data[msg_tuple[1]] = msg_tuple[2]
+                else:
+                    logger.warning(
+                        "Connection listener got unexpected message %s", msg)
 
     def get_num_new_matched_tokens(
             self, request: "Request",
@@ -337,6 +380,7 @@ class NixlConnectorWorker:
         # NIXL handshake port.
         # NOTE(rob): Within a DP group, each DP rank gets its own
         # port (which is sent in the KVTransferParams).
+        self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT +
             vllm_config.parallel_config.data_parallel_rank_local)
@@ -380,9 +424,6 @@ class NixlConnectorWorker:
         self._done_sending_count: defaultdict[str,
                                               int] = defaultdict(lambda: 0)
 
-        # Background thread for establishing new connections.
-        self._nixl_handshake_listener_t: Optional[threading.Thread] = None
-
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
 
@@ -390,37 +431,6 @@ class NixlConnectorWorker:
         # Optimization for models with local attention (Llama 4)
         # List of block window sizes for each layer for local attention
         self.block_window_per_layer: list[Optional[int]] = []
-
-    @staticmethod
-    def _nixl_handshake_listener(metadata: list[NixlAgentMetadata],
-                                 ready_event: threading.Event, port: int):
-        """Background thread for getting new NIXL handshakes."""
-        # NOTE(rob): this is a simple implementation. We will move
-        # to a better approach via HTTP endpoint soon.
-
-        encoded_data = []
-        for rank_metadata in metadata:
-            encoder = msgspec.msgpack.Encoder()
-            encoded_data.append(encoder.encode(rank_metadata))
-        size_in_bytes = sum(len(data) for data in encoded_data)
-        logger.debug("Size of encoded NixlAgentMetadata: %s bytes",
-                     str(size_in_bytes))
-
-        # Listen for new requests for metadata.
-        host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
-        path = make_zmq_path("tcp", "localhost", port)
-        logger.debug("Starting listening on path: %s", path)
-        with zmq_ctx(zmq.ROUTER, path) as sock:
-            ready_event.set()
-            while True:
-                identity, _, msg = sock.recv_multipart()
-                # Decode the message which contains (GET_META_MSG, rank)
-                msg_tuple = msgspec.msgpack.decode(msg)
-                if msg_tuple[0] != GET_META_MSG:
-                    logger.warning(
-                        "Connection listener got unexpected message %s", msg)
-                sock.send_multipart(
-                    (identity, b"", encoded_data[msg_tuple[1]]))
 
     def _nixl_handshake(self, host: str, port: int):
         """Do a NIXL handshake with a remote instance."""
@@ -446,6 +456,24 @@ class NixlConnectorWorker:
                          got_metadata_time - start_time)
             logger.debug("NIXL handshake: add agent took: %s",
                          setup_agent_time - got_metadata_time)
+
+    def _send_nixl_metadata(self, metadata: NixlAgentMetadata):
+        """Send NIXL metadata to the scheduler."""
+        # NOTE(rob): We will switch to HTTP-based NIXL metadata exchange.
+        path = make_zmq_path("tcp", self.side_channel_host,
+                             self.side_channel_port)
+        logger.debug("Rank %s: Sending metadata to path: %s", self.tp_rank, path)
+        with zmq_ctx(zmq.REQ, path) as sock:
+            encoder = msgspec.msgpack.Encoder()
+            encoded_data = encoder.encode(rank_metadata)
+            size_in_bytes = sum(len(data) for data in encoded_data)
+            logger.debug("Size of encoded NixlAgentMetadata: %s bytes",
+                        str(size_in_bytes))
+            # Send query for the request.
+            msg = msgspec.msgpack.encode((PUT_META_MSG, self.tp_rank,
+                                          encoded_data))
+            sock.send(msg)
+
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
@@ -534,36 +562,7 @@ class NixlConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
             num_blocks=self.num_blocks,
         )
-
-        # Only rank 0 starts the handshake listener and send it to remote models
-        # Other ranks send their metadata to rank 0
-        if self.tp_rank == 0:
-            # After KV Caches registered, listen for new connections.
-            logger.debug("Rank %s: Starting handshake listener", self.tp_rank)
-            combined_metadata = [rank_metadata]
-            for i in range(1, self.world_size):
-                combined_metadata.append(self.tp_group.recv_object(src=i))
-            for remote_metadata in combined_metadata:
-                if remote_metadata.engine_id != self.engine_id:
-                    raise RuntimeError(
-                        "Received metadata from different engine id: %s",
-                        remote_metadata.engine_id)
-
-            logger.debug("Rank %s: Received metadata from other ranks",
-                         self.tp_rank)
-
-            ready_event = threading.Event()
-            self._nixl_handshake_listener_t = threading.Thread(
-                target=self._nixl_handshake_listener,
-                args=(combined_metadata, ready_event, self.side_channel_port),
-                daemon=True,
-                name="nixl_handshake_listener")
-            self._nixl_handshake_listener_t.start()
-            ready_event.wait()
-        else:
-            # Other ranks send their metadata to rank 0
-            logger.debug("Rank %s: Sending metadata to rank 0", self.tp_rank)
-            self.tp_group.send_object(rank_metadata, dst=0)
+        self._send_nixl_metadata(rank_metadata)
 
     def add_remote_agent(self, nixl_agent_meta: NixlAgentMetadata):
         engine_id = nixl_agent_meta.engine_id
