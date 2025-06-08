@@ -190,7 +190,7 @@ class NixlConnectorScheduler:
         ready_event = threading.Event()
         self._nixl_metadata_listener_t = threading.Thread(
             target=self._nixl_metadata_listener,
-            args=(self, ready_event, side_channel_port),
+            args=(ready_event, side_channel_port),
             daemon=True,
             name="nixl_metadata_listener")
         self._nixl_metadata_listener_t.start()
@@ -199,7 +199,7 @@ class NixlConnectorScheduler:
         ready_event.wait()
 
     @staticmethod
-    def _nixl_metadata_listener(scheduler: NixlConnectorScheduler, ready_event: threading.Event, base_port: int):
+    def _nixl_metadata_listener(ready_event: threading.Event, base_port: int):
         """Background thread for getting new NIXL metadata."""
 
         # Store the encoded metadata for each rank
