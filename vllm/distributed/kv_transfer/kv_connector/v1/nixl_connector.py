@@ -190,7 +190,7 @@ class NixlConnectorScheduler:
         ready_event = threading.Event()
         self._nixl_metadata_listener_t = threading.Thread(
             target=self._nixl_metadata_listener,
-            args=(ready_event, side_channel_port),
+            args=(ready_event, self.side_channel_port),
             daemon=True,
             name="nixl_metadata_listener")
         self._nixl_metadata_listener_t.start()
@@ -457,7 +457,7 @@ class NixlConnectorWorker:
             logger.debug("NIXL handshake: add agent took: %s",
                          setup_agent_time - got_metadata_time)
 
-    def _send_nixl_metadata(self, metadata: NixlAgentMetadata):
+    def _send_nixl_metadata(self, rank_metadata: NixlAgentMetadata):
         """Send NIXL metadata to the scheduler."""
         # NOTE(rob): We will switch to HTTP-based NIXL metadata exchange.
         path = make_zmq_path("tcp", self.side_channel_host,
@@ -466,9 +466,8 @@ class NixlConnectorWorker:
         with zmq_ctx(zmq.REQ, path) as sock:
             encoder = msgspec.msgpack.Encoder()
             encoded_data = encoder.encode(rank_metadata)
-            size_in_bytes = sum(len(data) for data in encoded_data)
             logger.debug("Size of encoded NixlAgentMetadata: %s bytes",
-                        str(size_in_bytes))
+                        str(len(encoded_data)))
             # Send query for the request.
             msg = msgspec.msgpack.encode((PUT_META_MSG, self.tp_rank,
                                           encoded_data))
