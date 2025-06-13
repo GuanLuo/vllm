@@ -432,11 +432,11 @@ class NixlConnectorWorker:
         # NOTE(rob): we need each tp_rank to have a unique port.
         # This is a hack to keep us moving. We will switch when
         # we switch to HTTP-based NIXL metadata exchange.
-        path = make_zmq_path("tcp", host, port + self.tp_rank)
+        path = make_zmq_path("tcp", host, port)
         logger.debug("Querying metadata on path: %s", path)
         with zmq_ctx(zmq.REQ, path) as sock:
             # Send query for the request.
-            msg = msgspec.msgpack.encode((GET_META_MSG, rank))
+            msg = msgspec.msgpack.encode((GET_META_MSG, self.tp_rank))
             sock.send(msg)
             metadata_bytes = sock.recv()
             decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
